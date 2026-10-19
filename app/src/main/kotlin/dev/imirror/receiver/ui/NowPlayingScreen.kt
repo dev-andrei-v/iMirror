@@ -4,6 +4,7 @@ import android.content.Context
 import android.graphics.BitmapFactory
 import android.graphics.Color
 import android.graphics.drawable.GradientDrawable
+import android.text.TextUtils
 import android.util.AttributeSet
 import android.util.TypedValue
 import android.view.Gravity
@@ -21,9 +22,10 @@ import dev.imirror.receiver.util.Logger
  * from a Mac, Apple Music, podcasts). Mirroring shows the video [StreamingScreen] instead; this
  * screen fills the otherwise-black surface for audio-only sessions.
  *
- * Layout (centered): album art (or an AirPlay-glyph placeholder when the sender sends no artwork),
- * track title, artist, album, and a "♪ Audio from <sender>" footer. Built programmatically to match
- * the other overlay views ([PhotoScreen]/[StreamingScreen]).
+ * Layout (centered row): album art on the left (or an AirPlay-glyph placeholder when the sender
+ * sends no artwork), and on the right the track title, artist, album, and a "♪ Audio from <sender>"
+ * footer. The artwork takes a share of the screen height, so the card fits every TV. A 720p TV at
+ * tvdpi is only 540 dp tall; a vertical column with a fixed 360 dp artwork overflowed it.
  */
 class NowPlayingScreen @JvmOverloads constructor(
     context: Context,
@@ -40,15 +42,14 @@ class NowPlayingScreen @JvmOverloads constructor(
     init {
         setBackgroundColor(color(R.color.background_dark))
 
-        val column = LinearLayout(context).apply {
-            orientation = LinearLayout.VERTICAL
-            gravity = Gravity.CENTER
+        val row = LinearLayout(context).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
         }
 
         artwork = ImageView(context).apply {
-            layoutParams = LinearLayout.LayoutParams(dp(ART_SIZE_DP), dp(ART_SIZE_DP))
+            layoutParams = LinearLayout.LayoutParams(dp(ART_MAX_DP), dp(ART_MAX_DP))
             scaleType = ImageView.ScaleType.CENTER_CROP
-            // Rounded surface so the placeholder glyph (and any non-square art) sits on a card.
             background = GradientDrawable().apply {
                 setColor(color(R.color.background_surface))
                 cornerRadius = dp(16).toFloat()
@@ -56,60 +57,86 @@ class NowPlayingScreen @JvmOverloads constructor(
             clipToOutline = true
         }
 
-        titleView = textView(TITLE_SP, R.color.text_primary, bold = true).apply {
-            setPadding(0, dp(28), 0, 0)
+        titleView = textView(TITLE_SP, R.color.text_primary, bold = true, lines = 2)
+        artistView = textView(ARTIST_SP, R.color.text_secondary, lines = 1).apply {
+            setPadding(0, dp(10), 0, 0)
         }
-        artistView = textView(ARTIST_SP, R.color.text_secondary).apply {
-            setPadding(0, dp(8), 0, 0)
-        }
-        albumView = textView(ALBUM_SP, R.color.text_tertiary).apply {
+        albumView = textView(ALBUM_SP, R.color.text_tertiary, lines = 1).apply {
             setPadding(0, dp(4), 0, 0)
         }
-        senderView = textView(SENDER_SP, R.color.protocol_airplay).apply {
-            setPadding(0, dp(36), 0, 0)
+        senderView = textView(SENDER_SP, R.color.protocol_airplay, lines = 1).apply {
+            setPadding(0, dp(28), 0, 0)
         }
 
-        column.addView(artwork)
-        column.addView(titleView)
-        column.addView(artistView)
-        column.addView(albumView)
-        column.addView(senderView)
+        val textColumn = LinearLayout(context).apply {
+            orientation = LinearLayout.VERTICAL
+            gravity = Gravity.START or Gravity.CENTER_VERTICAL
+            setPadding(dp(TEXT_GAP_DP), 0, 0, 0)
+            addView(titleView)
+            addView(artistView)
+            addView(albumView)
+            addView(senderView)
+        }
+
+        row.addView(artwork)
+        row.addView(textColumn, LinearLayout.LayoutParams(LayoutParams.WRAP_CONTENT, LayoutParams.WRAP_CONTENT))
 
         addView(
-            column,
+            row,
             LayoutParams(LayoutParams.WRAP_CONTENT, LayoutParams.WRAP_CONTENT).apply {
                 gravity = Gravity.CENTER
             }
         )
     }
 
-    /** Updates the card to reflect [info]. Falls back to a placeholder glyph when no artwork. */
+    /** Size the artwork and the text column from the real screen size, so the card always fits. */
+    override fun onSizeChanged(w: Int, h: Int, oldw: Int, oldh: Int) {
+        super.onSizeChanged(w, h, oldw, oldh)
+        if (w == 0 || h == 0) return
+        val art = (h * ART_HEIGHT_SHARE).toInt().coerceAtMost(dp(ART_MAX_DP))
+        artwork.layoutParams = LinearLayout.LayoutParams(art, art)
+        val room = w - art - dp(TEXT_GAP_DP) - dp(2 * EDGE_DP)
+        val textWidth = (w * TEXT_WIDTH_SHARE).toInt().coerceAtMost(room).coerceAtLeast(dp(120))
+        for (view in listOf(titleView, artistView, albumView, senderView)) view.maxWidth = textWidth
+        requestLayout()
+    }
+
     fun update(info: NowPlayingInfo) {
-        val bitmap = info.artwork?.let { runCatching { BitmapFactory.decodeByteArray(it, 0, it.size) }.getOrNull() }
+        val bitmap = info.artwork?.let { decodeArtwork(it) }
         if (bitmap != null) {
             artwork.scaleType = ImageView.ScaleType.CENTER_CROP
             artwork.setImageBitmap(bitmap)
             artwork.setColorFilter(null)
         } else {
-            // No artwork from the sender (typical for raw system audio) — show the AirPlay glyph.
             artwork.scaleType = ImageView.ScaleType.CENTER_INSIDE
             artwork.setImageResource(R.drawable.ic_airplay)
             artwork.setColorFilter(color(R.color.text_secondary))
-            if (bitmap == null && info.artwork != null) {
+            if (info.artwork != null) {
                 Logger.w("NowPlayingScreen: artwork bytes (${info.artwork.size}B) failed to decode")
             }
         }
-
         titleView.text = info.title ?: context.getString(R.string.now_playing_audio)
         artistView.setTextVisible(info.artist)
         albumView.setTextVisible(info.album)
         senderView.text = context.getString(R.string.now_playing_from, info.senderName)
     }
 
-    /** Releases the (potentially large) artwork bitmap when the card is hidden. */
     fun clear() {
         artwork.setImageDrawable(null)
     }
+
+    /**
+     * Decode the artwork near the size it is shown at. Senders push covers of 1500 px and more;
+     * a full decode of one is 9 MB, which a 1 GB TV cannot spare for a card.
+     */
+    private fun decodeArtwork(bytes: ByteArray) = runCatching {
+        val bounds = BitmapFactory.Options().apply { inJustDecodeBounds = true }
+        BitmapFactory.decodeByteArray(bytes, 0, bytes.size, bounds)
+        val target = dp(ART_MAX_DP).coerceAtLeast(1)
+        var sample = 1
+        while (bounds.outWidth / (sample * 2) >= target && bounds.outHeight / (sample * 2) >= target) sample *= 2
+        BitmapFactory.decodeByteArray(bytes, 0, bytes.size, BitmapFactory.Options().apply { inSampleSize = sample })
+    }.getOrNull()
 
     private fun TextView.setTextVisible(value: String?) {
         if (value.isNullOrBlank()) {
@@ -120,11 +147,12 @@ class NowPlayingScreen @JvmOverloads constructor(
         }
     }
 
-    private fun textView(sizeSp: Float, colorRes: Int, bold: Boolean = false) = TextView(context).apply {
+    private fun textView(sizeSp: Float, colorRes: Int, bold: Boolean = false, lines: Int) = TextView(context).apply {
         setTextColor(color(colorRes))
         setTextSize(TypedValue.COMPLEX_UNIT_SP, sizeSp)
-        gravity = Gravity.CENTER
-        maxLines = 2
+        gravity = Gravity.START
+        maxLines = lines
+        ellipsize = TextUtils.TruncateAt.END
         if (bold) setTypeface(typeface, android.graphics.Typeface.BOLD)
     }
 
@@ -134,7 +162,13 @@ class NowPlayingScreen @JvmOverloads constructor(
         (value * resources.displayMetrics.density).toInt()
 
     companion object {
-        private const val ART_SIZE_DP = 360
+        /** The artwork edge as a share of the screen height, capped at [ART_MAX_DP]. */
+        private const val ART_HEIGHT_SHARE = 0.56f
+        private const val ART_MAX_DP = 420
+        /** The text column as a share of the screen width. */
+        private const val TEXT_WIDTH_SHARE = 0.42f
+        private const val TEXT_GAP_DP = 48
+        private const val EDGE_DP = 48
         private const val TITLE_SP = 30f
         private const val ARTIST_SP = 22f
         private const val ALBUM_SP = 17f
