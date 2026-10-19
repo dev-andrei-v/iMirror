@@ -325,7 +325,10 @@ class MdnsService(
          * AirPlay feature bitmask: advertise screen mirroring, video, and audio support.
          * See TECHNICAL_SPEC.md §8 for the full bit-level breakdown.
          */
-        private const val AIRPLAY_FEATURES = "0x5A7FFFF7,0x1E"
+        // Bit 42 (SupportsScreenMultiCodec, high word 0x400) tells iOS 27 senders that H.265 is
+        // accepted. Without it they still send H.265 but with an empty config packet, which ended
+        // every session after a few seconds. Keep InfoResponder.AIRPLAY_FEATURES in step.
+        private const val AIRPLAY_FEATURES = "0x5A7FFFF7,0x41E"
 
         /** Pretend to be an Apple TV so macOS uses the screen mirroring protocol. */
         private const val AIRPLAY_MODEL = "AppleTV5,3"

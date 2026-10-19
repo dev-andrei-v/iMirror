@@ -39,8 +39,12 @@ class MirrorStreamServer(
     private val height: Int = 1080,
 ) {
     private sealed class Item
-    private class Config(val sps: ByteArray, val pps: ByteArray) : Item()
+    /** Parameter sets. [vps] is present for H.265 (iOS 27 mirrors in HEVC) and null for H.264. */
+    private class Config(val sps: ByteArray, val pps: ByteArray, val vps: ByteArray? = null) : Item()
     private class Frame(val annexB: ByteArray) : Item()
+
+    /** The `hvcC` box tag inside an H.265 config payload. */
+    private val HVCC_FOURCC = byteArrayOf('h'.code.toByte(), 'v'.code.toByte(), 'c'.code.toByte(), 'C'.code.toByte())
 
     private val cipher = MirrorCrypto.streamCipher(aesKey, ecdhSecret, streamConnectionId)
     private val serverSocket = ServerSocket(0)            // OS-assigned free port
@@ -51,6 +55,7 @@ class MirrorStreamServer(
     @Volatile private var decoder: VideoDecoder? = null   // owned by the decoder thread
     private var lastSps: ByteArray? = null
     private var lastPps: ByteArray? = null
+    private var lastVps: ByteArray? = null                // non-null while the stream is H.265
     // The Surface the current decoder was built against. The SurfaceView destroys its Surface when
     // the app backgrounds and creates a NEW one on return, so we watch for the identity changing
     // and rebuild the decoder — otherwise video stays black after foregrounding.
@@ -92,7 +97,14 @@ class MirrorStreamServer(
                 if (!readFully(input, header, 128)) break
                 val payloadSize = leInt(header, 0)
                 val payloadType = leShort(header, 4) and 0xFF
-                if (payloadSize <= 0 || payloadSize > MAX_PAYLOAD) {
+                if (payloadSize == 0) {
+                    // iOS 27 sends a header-only (empty) packet, usually type 1, early in the
+                    // session. Treating it as an error ended the session after a few seconds.
+                    // There is nothing to decrypt or decode, so skip it and keep reading.
+                    Logger.w("Mirror: empty payload type=$payloadType — skipping")
+                    continue
+                }
+                if (payloadSize < 0 || payloadSize > MAX_PAYLOAD) {
                     Logger.w("Mirror: bad payloadSize=$payloadSize type=$payloadType — stopping")
                     break
                 }
@@ -138,15 +150,71 @@ class MirrorStreamServer(
     }
 
     private fun parseConfig(payload: ByteArray): Config? = try {
-        val spsSize = ((payload[6].toInt() and 0xFF) shl 8) or (payload[7].toInt() and 0xFF)
-        val sps = payload.copyOfRange(8, 8 + spsSize)
-        val ppsLenOffset = 8 + spsSize + 1                   // skip the 1-byte PPS count
-        val ppsSize = ((payload[ppsLenOffset].toInt() and 0xFF) shl 8) or
-            (payload[ppsLenOffset + 1].toInt() and 0xFF)
-        Config(sps, payload.copyOfRange(ppsLenOffset + 2, ppsLenOffset + 2 + ppsSize))
+        val hvcc = indexOfFourcc(payload, HVCC_FOURCC)
+        if (hvcc >= 0) {
+            parseHevcConfig(payload, hvcc + 4)
+        } else {
+            val spsSize = ((payload[6].toInt() and 0xFF) shl 8) or (payload[7].toInt() and 0xFF)
+            val sps = payload.copyOfRange(8, 8 + spsSize)
+            val ppsLenOffset = 8 + spsSize + 1                   // skip the 1-byte PPS count
+            val ppsSize = ((payload[ppsLenOffset].toInt() and 0xFF) shl 8) or
+                (payload[ppsLenOffset + 1].toInt() and 0xFF)
+            Config(sps, payload.copyOfRange(ppsLenOffset + 2, ppsLenOffset + 2 + ppsSize))
+        }
     } catch (e: Exception) {
         Logger.e("Mirror: failed to parse SPS/PPS", e); null
     }
+
+    /**
+     * H.265 config (iOS 27): the payload is an ISO `hvc1` sample entry that holds an `hvcC` box.
+     * The record has a 22-byte header, then `numOfArrays`, then one array per NAL type:
+     * 1 byte type (low 6 bits), 2-byte count, and per NAL a 2-byte length and the bytes.
+     * VPS = 32, SPS = 33, PPS = 34.
+     */
+    private fun parseHevcConfig(payload: ByteArray, recordStart: Int): Config? {
+        var vps: ByteArray? = null
+        var sps: ByteArray? = null
+        var pps: ByteArray? = null
+        var p = recordStart + 22
+        val arrays = payload[p].toInt() and 0xFF
+        p += 1
+        repeat(arrays) {
+            val type = payload[p].toInt() and 0x3F
+            val count = beShort(payload, p + 1)
+            p += 3
+            repeat(count) {
+                val len = beShort(payload, p)
+                val nal = payload.copyOfRange(p + 2, p + 2 + len)
+                p += 2 + len
+                when (type) {
+                    32 -> vps = vps ?: nal
+                    33 -> sps = sps ?: nal
+                    34 -> pps = pps ?: nal
+                }
+            }
+        }
+        val v = vps; val s = sps; val q = pps
+        if (v == null || s == null || q == null) {
+            Logger.w("Mirror: hvcC without VPS/SPS/PPS (arrays=$arrays)")
+            return null
+        }
+        Logger.i("Mirror: H.265 config (vps=${v.size}B sps=${s.size}B pps=${q.size}B)")
+        return Config(s, q, v)
+    }
+
+    private fun indexOfFourcc(data: ByteArray, fourcc: ByteArray): Int {
+        var i = 0
+        while (i + fourcc.size <= data.size) {
+            var match = true
+            for (k in fourcc.indices) if (data[i + k] != fourcc[k]) { match = false; break }
+            if (match) return i
+            i++
+        }
+        return -1
+    }
+
+    private fun beShort(b: ByteArray, off: Int): Int =
+        ((b[off].toInt() and 0xFF) shl 8) or (b[off + 1].toInt() and 0xFF)
 
     // ─── Decoder thread: consume the queue; the only thread that touches the decoder ──────────
     private fun runDecoder() {
@@ -154,7 +222,7 @@ class MirrorStreamServer(
             while (running) {
                 val item = queue.poll(200, TimeUnit.MILLISECONDS) ?: continue
                 when (item) {
-                    is Config -> configureDecoder(item.sps, item.pps)
+                    is Config -> configureDecoder(item)
                     is Frame -> decodeFrame(item.annexB)
                 }
             }
@@ -166,14 +234,17 @@ class MirrorStreamServer(
         }
     }
 
-    private fun configureDecoder(sps: ByteArray, pps: ByteArray) {
-        // New SPS/PPS (or first config) — cache it and (re)build against the current surface.
+    private fun configureDecoder(config: Config) {
+        // New parameter sets (or first config) — cache them and (re)build against the current surface.
         val d = decoder
         val surface = awaitSurface()
-        if (d != null && d.isHealthy && sps.contentEquals(lastSps) && pps.contentEquals(lastPps) &&
-            surface === configuredSurface) return
-        lastSps = sps
-        lastPps = pps
+        val sameVps = (config.vps == null && lastVps == null) ||
+            (config.vps != null && config.vps.contentEquals(lastVps))
+        if (d != null && d.isHealthy && config.sps.contentEquals(lastSps) && config.pps.contentEquals(lastPps) &&
+            sameVps && surface === configuredSurface) return
+        lastSps = config.sps
+        lastPps = config.pps
+        lastVps = config.vps
         rebuildDecoder(surface)
     }
 
@@ -191,10 +262,13 @@ class MirrorStreamServer(
         val pps = lastPps ?: return
         if (surface == null) return                            // backgrounded — wait for the surface to return
         val sc = MirrorCrypto.START_CODE
-        decoder = VideoDecoder(surface).also { it.initialize(sc + sps, sc + pps, width, height) }
+        val vps = lastVps
+        decoder = VideoDecoder(surface).also {
+            it.initialize(sc + sps, sc + pps, width, height, vpsBytes = vps?.let { v -> sc + v })
+        }
         awaitingKeyframe = true                                // a fresh decoder must start at an IDR
         StreamStats.videoRes = "${width}x${height}"
-        Logger.i("Mirror decoder (re)built for surface (sps=${sps.size}B pps=${pps.size}B)")
+        Logger.i("Mirror decoder (re)built for surface (${if (vps != null) "H.265" else "H.264"} sps=${sps.size}B pps=${pps.size}B)")
     }
 
     private fun decodeFrame(annexB: ByteArray) {
@@ -208,7 +282,7 @@ class MirrorStreamServer(
         val d = decoder ?: return                              // need surface + SPS/PPS first
         if (!d.isHealthy) {                                    // error state — drop, await next config
             Logger.w("Mirror: decoder unhealthy — dropping, awaiting new SPS/PPS")
-            d.release(); decoder = null; configuredSurface = null; lastSps = null; lastPps = null
+            d.release(); decoder = null; configuredSurface = null; lastSps = null; lastPps = null; lastVps = null
             return
         }
         if (awaitingKeyframe) {
@@ -223,12 +297,21 @@ class MirrorStreamServer(
         framePtsUs += FRAME_INTERVAL_US
     }
 
-    /** True if the Annex-B frame contains an IDR NAL unit (type 5) — a decodable resync point. */
+    /**
+     * True if the Annex-B frame holds a decodable resync point: an H.264 IDR slice (type 5), or an
+     * H.265 IDR/CRA picture (types 19, 20, 21; the H.265 type sits in bits 1..6 of the first byte).
+     */
     private fun isKeyframe(annexB: ByteArray): Boolean {
+        val hevc = lastVps != null
         var i = 0
         while (i + 3 < annexB.size) {
             if (annexB[i].toInt() == 0 && annexB[i + 1].toInt() == 0 && annexB[i + 2].toInt() == 1) {
-                if ((annexB[i + 3].toInt() and 0x1F) == 5) return true   // IDR slice
+                val first = annexB[i + 3].toInt() and 0xFF
+                if (hevc) {
+                    if (((first shr 1) and 0x3F) in 19..21) return true // IDR_W_RADL, IDR_N_LP, CRA
+                } else if ((first and 0x1F) == 5) {
+                    return true                                          // IDR slice
+                }
                 i += 3
             } else {
                 i++

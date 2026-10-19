@@ -67,40 +67,50 @@ class VideoDecoder(private val outputSurface: Surface) {
      * @param width     Video width in pixels (from SDP)
      * @param height    Video height in pixels (from SDP)
      */
-    fun initialize(spsBytes: ByteArray, ppsBytes: ByteArray, width: Int, height: Int) {
+    fun initialize(spsBytes: ByteArray, ppsBytes: ByteArray, width: Int, height: Int, vpsBytes: ByteArray? = null) {
         if (isInitialized) {
             Logger.w("VideoDecoder.initialize() called twice — ignoring second call")
             return
         }
+
+        // H.265 when the sender gave a VPS (iOS 27 mirrors in HEVC); H.264 otherwise.
+        val hevc = vpsBytes != null
+        val mime = if (hevc) MediaFormat.MIMETYPE_VIDEO_HEVC else MediaFormat.MIMETYPE_VIDEO_AVC
+        val codecName = if (hevc) "H.265" else "H.264"
 
         // Try to extract actual resolution from the SPS NAL unit. The parser can misread some senders'
         // SPS (e.g. iPhone) and return nonsense like 32x87392 — configuring MediaCodec with that wedges
         // the decoder (no input buffers, no frames). Validate the result and fall back to the hint; the
         // hardware decoder reads the true size from the SPS (csd-0) itself and reports it via
         // INFO_OUTPUT_FORMAT_CHANGED, which we use to refine the size for aspect-fit.
-        val parsed = Companion.parseSpsResolution(spsBytes)
+        // The parser reads H.264 syntax only, so H.265 uses the hint.
+        val parsed = if (hevc) null else Companion.parseSpsResolution(spsBytes)
         val (actualWidth, actualHeight) = parsed?.takeIf { isPlausibleSize(it.first, it.second) } ?: run {
-            Logger.w("SPS resolution $parsed implausible/failed — using hint ${width}x${height}")
+            if (!hevc) Logger.w("SPS resolution $parsed implausible/failed — using hint ${width}x${height}")
             Pair(width, height)
         }
 
-        Logger.i("Initializing H.264 decoder: ${actualWidth}x${actualHeight} " +
+        Logger.i("Initializing $codecName decoder: ${actualWidth}x${actualHeight} " +
                  "(hint was ${width}x${height})")
 
         // Provisional size for StreamingScreen aspect-fit; replaced by the decoder's reported size.
         StreamStats.videoWidth = actualWidth
         StreamStats.videoHeight = actualHeight
 
-        // Create the MediaFormat that describes the H.264 stream to the hardware decoder
+        // Create the MediaFormat that describes the stream to the hardware decoder
         val format = MediaFormat.createVideoFormat(
-            MediaFormat.MIMETYPE_VIDEO_AVC,  // AVC = Advanced Video Coding = H.264
+            mime,
             actualWidth,
             actualHeight
         ).apply {
-            // Provide SPS and PPS so MediaCodec can configure the hardware decoder.
-            // These are wrapped in ByteBuffers as required by the MediaCodec API.
-            setByteBuffer("csd-0", java.nio.ByteBuffer.wrap(spsBytes))  // SPS
-            setByteBuffer("csd-1", java.nio.ByteBuffer.wrap(ppsBytes))  // PPS
+            // Provide the parameter sets so MediaCodec can configure the hardware decoder.
+            // H.264 takes SPS and PPS in csd-0 and csd-1. H.265 takes VPS + SPS + PPS in csd-0.
+            if (hevc) {
+                setByteBuffer("csd-0", java.nio.ByteBuffer.wrap(vpsBytes!! + spsBytes + ppsBytes))
+            } else {
+                setByteBuffer("csd-0", java.nio.ByteBuffer.wrap(spsBytes))  // SPS
+                setByteBuffer("csd-1", java.nio.ByteBuffer.wrap(ppsBytes))  // PPS
+            }
             // NOTE: do NOT set KEY_MAX_WIDTH/HEIGHT here — this SoC's MStar decoder rejects
             // adaptive playback (BadParameter / buffer-count failures) and produces banding.
             // Resolution changes are handled by recreating the decoder in MirrorStreamServer.
@@ -131,7 +141,7 @@ class VideoDecoder(private val outputSurface: Surface) {
         // Create the hardware H.264 decoder.
         // "video/avc" is the MIME type for H.264. Android will pick the best
         // available hardware decoder for this format.
-        mediaCodec = MediaCodec.createDecoderByType(MediaFormat.MIMETYPE_VIDEO_AVC)
+        mediaCodec = MediaCodec.createDecoderByType(mime)
 
         // Configure the decoder:
         // - format: what the input will look like (H.264, width, height, SPS/PPS)
@@ -142,7 +152,7 @@ class VideoDecoder(private val outputSurface: Surface) {
         mediaCodec!!.start()
 
         isInitialized = true
-        Logger.i("H.264 decoder initialized successfully")
+        Logger.i("$codecName decoder initialized successfully")
     }
 
     /**

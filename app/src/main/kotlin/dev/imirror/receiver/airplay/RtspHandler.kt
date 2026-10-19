@@ -995,7 +995,9 @@ open class RtspHandler(
         private const val MAX_PAIR_ATTEMPTS = 10
         private const val BIND_MAX_ATTEMPTS = 12      // ~3s total — covers a quick stop→start restart
         private const val BIND_RETRY_MS = 250L
-        private const val MAX_MESSAGE_BYTES = 65536
+        // iOS 27 sends now-playing artwork as a SET_PARAMETER body of 100 KB and more. The old
+        // 64 KB limit rejected it and dropped the session two seconds after audio started.
+        private const val MAX_MESSAGE_BYTES = 4 * 1024 * 1024
         private const val OCTET_STREAM = "application/octet-stream"
         private const val TIMING_PORT = 6002   // matches TimingHandler's UDP NTP port
         private const val SESSION_ID = "iMirrorSession"

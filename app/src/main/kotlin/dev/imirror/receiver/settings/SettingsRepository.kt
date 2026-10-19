@@ -105,7 +105,7 @@ class SettingsRepository(private val context: Context) {
      * Missing keys fall back to their default values in [AppSettings].
      */
     private fun Preferences.toAppSettings(): AppSettings = AppSettings(
-        displayName        = this[Keys.DISPLAY_NAME]            ?: "Pratik AirPlay",
+        displayName        = this[Keys.DISPLAY_NAME]            ?: "iMirror AirPlay",
         airPlayEnabled     = this[Keys.AIRPLAY_ENABLED]         ?: true,
         airPlayPinAuthEnabled = this[Keys.AIRPLAY_PIN_AUTH]     ?: false,
         startOnBoot        = this[Keys.START_ON_BOOT]           ?: false,

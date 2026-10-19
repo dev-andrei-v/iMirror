@@ -69,7 +69,7 @@ object InfoResponder {
     }
 
     /** 64-bit features value; mirrors MdnsService's "0x5A7FFFF7,0x1E" (low,high 32-bit halves). */
-    private const val AIRPLAY_FEATURES = 0x1E5A7FFFF7L
+    private const val AIRPLAY_FEATURES = 0x41E5A7FFFF7L   // bit 42 set: H.265 accepted (see MdnsService)
 
     /** Matches RPiPlay's /info statusFlags (0x44). */
     private const val STATUS_FLAGS = 68L
